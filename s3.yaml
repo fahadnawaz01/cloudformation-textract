@@ -5,7 +5,7 @@ Description: A template to create a single S3 bucket and a Lambda permission to
 Parameters:
   S3BucketName:
     Type: String
-    Default: textract-async-bucket-011001
+    Default: your-bucket-name
     Description: The unique S3 bucket name. Must be globally unique.
 
 Resources:

@@ -1,0 +1,153 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: A template to create a single S3 bucket and a Lambda permission to
+  avoid circular dependency.
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Default: textract-async-bucket-011001
+    Description: The unique S3 bucket name. Must be globally unique.
+
+Resources:
+  TextractSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: TextractCompletionTopic
+
+  TextractSNSRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: TextractToSNSRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: textract.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TextractPublishToSNSPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref TextractSNSTopic
+
+  # This is the IAM Role that grants permissions to the Lambda function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaTextractExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+      Policies:
+        - PolicyName: LambdaTextractPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub arn:aws:s3:::${S3BucketName}/*
+              - Effect: Allow
+                Action:
+                  - textract:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:*
+                Resource: '*'
+
+  # This is the Lambda function itself
+  LambdaTextractAsyncFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: LambdaTextractAsyncFunction
+      Handler: async-textract.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: codebase-011001
+        S3Key: async-textract.zip
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          OUTPUT_BUCKET_NAME: !Ref S3BucketName
+          OUTPUT_S3_PREFIX: async-op
+          SNS_TOPIC_ARN: !Ref TextractSNSTopic
+          SNS_ROLE_ARN: !Ref TextractSNSRole
+
+  LambdaTextractCSVFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: LambdaTextractCSVFunction
+      Handler: csv-converter.lambda_handler
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: codebase-011001
+        S3Key: csv-converter.zip
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          OUTPUT_BUCKET_NAME: !Ref S3BucketName
+          OUTPUT_S3_PREFIX: csv-op
+      Layers:
+        - arn:aws:lambda:us-east-1:869935112458:layer:lambda-pandas:2
+
+  PermissionForSNSToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt LambdaTextractCSVFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref TextractSNSTopic
+
+  # This is the SNS subscription that triggers the CSV Lambda
+  TextractSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: lambda
+      Endpoint: !GetAtt LambdaTextractCSVFunction.Arn
+      TopicArn: !Ref TextractSNSTopic
+
+  MyS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3BucketName
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt LambdaTextractAsyncFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .pdf
+                  - Name: prefix
+                    Value: file-store/
+
+  # This resource grants S3 permission to invoke the Lambda function
+  # We use !Sub to build the SourceArn, which breaks the circular dependency
+  PermissionForS3ToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt LambdaTextractAsyncFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::${S3BucketName}
